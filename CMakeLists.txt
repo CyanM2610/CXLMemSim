@@ -108,7 +108,14 @@ else()
 endif()
 
 # Server library (shared between server executable and tests)
-set(SERVER_LIB_SOURCES src/shared_memory_manager.cc src/shm_communication.cpp src/distributed_server.cpp src/tcp_communication.cpp src/rdma_communication.cpp)
+set(SERVER_LIB_SOURCES
+    src/shared_memory_manager.cc
+    src/shm_communication.cpp
+    src/distributed_server.cpp
+    src/tcp_communication.cpp
+    src/rdma_communication.cpp
+    src/cxl_bulk_server.cpp
+    src/cxl_bulk_model.cpp)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/ssd_streaming_backend.h" AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ssd_streaming_backend.cpp")
     message(STATUS "SSD streaming backend enabled")
@@ -167,6 +174,25 @@ target_include_directories(test_pgas_controller_counters PRIVATE include src ${s
 target_link_libraries(test_pgas_controller_counters cxlmemsim spdlog::spdlog_header_only ${RT_LIB} ${ATOMIC_LIB})
 add_test(NAME test_pgas_controller_counters COMMAND test_pgas_controller_counters)
 
+add_executable(test_cxl_bulk_model
+    tests/test_cxl_bulk_model.cpp
+    src/cxl_bulk_model.cpp)
+target_include_directories(test_cxl_bulk_model PRIVATE include)
+add_test(NAME test_cxl_bulk_model COMMAND test_cxl_bulk_model)
+
+add_library(cxlmemsim_client SHARED src/cxl_bulk_client.c)
+target_include_directories(cxlmemsim_client PUBLIC include)
+target_link_libraries(cxlmemsim_client PRIVATE ${RT_LIB})
+
+add_executable(test_cxl_bulk_transport
+    tests/test_cxl_bulk_transport.cpp
+    src/cxl_bulk_server.cpp
+    src/cxl_bulk_model.cpp)
+target_include_directories(test_cxl_bulk_transport PRIVATE include)
+target_link_libraries(test_cxl_bulk_transport
+    cxlmemsim_client ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_cxl_bulk_transport COMMAND test_cxl_bulk_transport)
+
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
 add_executable(test_back_invalidation tests/test_back_invalidation.cpp)
@@ -180,6 +206,11 @@ target_link_libraries(test_dax_back_invalidation ${RT_LIB} ${ATOMIC_LIB})
 # Installation targets
 install(TARGETS cxlmemsim_server
         RUNTIME DESTINATION bin)
+install(TARGETS cxlmemsim_client
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
 
-install(FILES include/tcp_communication.h include/rdma_communication.h include/dcd_gfam.h
+install(FILES include/tcp_communication.h include/rdma_communication.h
+        include/dcd_gfam.h include/cxl_bulk.h
         DESTINATION include/cxlmemsim)

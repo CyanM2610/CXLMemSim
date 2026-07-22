@@ -353,8 +353,12 @@ SharedMemoryManager::SharedMemoryInfo SharedMemoryManager::get_shm_info() const 
     SharedMemoryInfo info;
     info.shm_name = shm_name;
     info.size = backing_mode == BackingMode::SsdStream ? data_capacity_bytes() : shm_size;
+    info.mapped_size = backing_mode == BackingMode::SsdStream ? 0 : shm_size;
+    info.data_offset = backing_mode == BackingMode::SsdStream ? 0 : sizeof(SharedMemoryHeader);
+    info.data_size = data_capacity_bytes();
     info.base_addr = header ? header->base_addr : 0;
     info.num_cachelines = header ? header->num_cachelines : 0;
+    info.direct_mappable = backing_mode == BackingMode::SharedMemory;
     return info;
 }
 

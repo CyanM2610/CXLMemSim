@@ -10,6 +10,7 @@
 
 #include "../include/shared_memory_manager.h"
 #include "cxl_backend.h"
+#include "cxl_bulk_server.h"
 #include "cxlcontroller.h"
 #include "cxlendpoint.h"
 #include "distributed_server.h"
@@ -30,9 +31,9 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <set>
 #include <shared_mutex>
 #include <signal.h>
-#include <set>
 #include <spdlog/cfg/env.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
@@ -125,6 +126,7 @@ enum class CommMode {
     TCP,
     SHM, // Shared Memory via /dev/shm (ring buffer based)
     PGAS_SHM, // PGAS Shared Memory (lock-free slots for cxl_backend.h clients)
+    BULK_SHM, // Bulk descriptors plus directly mapped data
     DISTRIBUTED // Distributed multi-node memory server
 };
 
@@ -147,6 +149,13 @@ private:
     cxl_shm_header_t *pgas_shm_header_;
     void *pgas_memory_;
     size_t pgas_memory_size_;
+
+    std::string bulk_shm_name_;
+    double bulk_read_bandwidth_gbps_;
+    double bulk_write_bandwidth_gbps_;
+    uint64_t bulk_read_latency_ns_;
+    uint64_t bulk_write_latency_ns_;
+    std::unique_ptr<CxlBulkShmServer> bulk_server_;
 
     // Shared memory manager for real memory allocation
     std::unique_ptr<SharedMemoryManager> shm_manager;
@@ -221,15 +230,20 @@ private:
     }
 
 public:
-    ThreadPerConnectionServer(int port, CXLController *ctrl, size_t capacity_mb, const std::string &backing_file = "",
-                              CommMode mode = CommMode::TCP,
-                              const std::string &pgas_shm_name = "/cxlmemsim_pgas",
-                              SharedMemoryManager::BackingMode backing_mode =
-                                  SharedMemoryManager::BackingMode::SharedMemory,
-                              const SharedMemoryManager::SsdStreamingConfig &ssd_config = {})
+    ThreadPerConnectionServer(
+        int port, CXLController *ctrl, size_t capacity_mb, const std::string &backing_file = "",
+        CommMode mode = CommMode::TCP, const std::string &pgas_shm_name = "/cxlmemsim_pgas",
+        const std::string &bulk_shm_name = "/cxlmemsim_bulk", double bulk_read_bandwidth_gbps = 25.0,
+        double bulk_write_bandwidth_gbps = 25.0, uint64_t bulk_read_latency_ns = 100,
+        uint64_t bulk_write_latency_ns = 150,
+        SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory,
+        const SharedMemoryManager::SsdStreamingConfig &ssd_config = {})
         : server_fd(-1), port(port), controller(ctrl), running(true), next_thread_id(0), comm_mode(mode),
           pgas_shm_name_(pgas_shm_name), pgas_shm_fd_(-1), pgas_shm_header_(nullptr), pgas_memory_(nullptr),
-          pgas_memory_size_(0), backing_file_(backing_file), backing_mode_(backing_mode), ssd_config_(ssd_config) {
+          pgas_memory_size_(0), bulk_shm_name_(bulk_shm_name), bulk_read_bandwidth_gbps_(bulk_read_bandwidth_gbps),
+          bulk_write_bandwidth_gbps_(bulk_write_bandwidth_gbps), bulk_read_latency_ns_(bulk_read_latency_ns),
+          bulk_write_latency_ns_(bulk_write_latency_ns), backing_file_(backing_file), backing_mode_(backing_mode),
+          ssd_config_(ssd_config) {
         congestion_info.active_requests = 0;
         congestion_info.total_bandwidth_used = 0;
         congestion_info.last_reset = std::chrono::steady_clock::now();
@@ -265,6 +279,8 @@ public:
     void run_pgas_shm_mode();
     int poll_pgas_shm_requests();
     void cleanup_pgas_shm();
+
+    void run_bulk_shm_mode();
 
 private:
     // Coherency protocol methods
@@ -340,6 +356,9 @@ struct ServerOptions {
     bool ssd_odirect = true;
     std::string comm_mode_str = "tcp";
     std::string pgas_shm_name = "/cxlmemsim_pgas";
+    std::string bulk_shm_name = "/cxlmemsim_bulk";
+    double bulk_read_bandwidth = 25.0;
+    double bulk_write_bandwidth = 25.0;
     uint32_t node_id = 0;
     std::string dist_shm_name = "/cxlmemsim_dist";
     std::string coordinator_shm;
@@ -377,8 +396,11 @@ static void print_server_help(const char *program) {
               << "      --ssd-read-ahead-pages <count> SSD read-ahead pages (default: 16 = 64KB)\n"
               << "      --ssd-io-uring[=true|false]    Use io_uring on Linux when available\n"
               << "      --ssd-odirect[=true|false]     Use O_DIRECT when backend supports it\n"
-              << "      --comm-mode <mode>             tcp, shm, pgas-shm, or distributed\n"
+              << "      --comm-mode <mode>             tcp, shm, pgas-shm, bulk-shm, or distributed\n"
               << "      --pgas-shm-name <name>         PGAS shared memory name\n"
+              << "      --bulk-shm-name <name>         Bulk control shared memory name\n"
+              << "      --bulk-read-bandwidth <GB/s>   Bulk read bandwidth (default: 25)\n"
+              << "      --bulk-write-bandwidth <GB/s>  Bulk write bandwidth (default: 25)\n"
               << "      --node-id <id>                 Distributed node ID\n"
               << "      --dist-shm-name <name>         Distributed shared memory name\n"
               << "      --coordinator-shm <name>       Coordinator shared memory to join\n"
@@ -555,6 +577,12 @@ static bool parse_server_options(int argc, char *argv[], ServerOptions &opts, st
                 opts.comm_mode_str = get_value(key);
             } else if (key == "pgas-shm-name") {
                 opts.pgas_shm_name = get_value(key);
+            } else if (key == "bulk-shm-name") {
+                opts.bulk_shm_name = get_value(key);
+            } else if (key == "bulk-read-bandwidth") {
+                opts.bulk_read_bandwidth = std::stod(get_value(key));
+            } else if (key == "bulk-write-bandwidth") {
+                opts.bulk_write_bandwidth = std::stod(get_value(key));
             } else if (key == "node-id") {
                 opts.node_id = static_cast<uint32_t>(std::stoul(get_value(key)));
             } else if (key == "dist-shm-name") {
@@ -623,6 +651,9 @@ int main(int argc, char *argv[]) {
     const auto &topology = opts.topology;
     const auto &comm_mode_str = opts.comm_mode_str;
     const auto &pgas_shm_name = opts.pgas_shm_name;
+    const auto &bulk_shm_name = opts.bulk_shm_name;
+    double bulk_read_bandwidth = opts.bulk_read_bandwidth;
+    double bulk_write_bandwidth = opts.bulk_write_bandwidth;
     uint32_t node_id = opts.node_id;
     const auto &dist_shm_name = opts.dist_shm_name;
     const auto &coordinator_shm = opts.coordinator_shm;
@@ -684,6 +715,10 @@ int main(int argc, char *argv[]) {
         SPDLOG_ERROR("--ssd-backing-file requires --backing-mode=ssd-stream or no explicit --backing-mode");
         return 1;
     }
+    if (bulk_read_bandwidth <= 0.0 || bulk_write_bandwidth <= 0.0) {
+        SPDLOG_ERROR("Bulk read and write bandwidths must be positive");
+        return 1;
+    }
 
     SharedMemoryManager::SsdStreamingConfig ssd_config;
     ssd_config.backing_path = ssd_backing_file;
@@ -716,10 +751,19 @@ int main(int argc, char *argv[]) {
         comm_mode = CommMode::SHM;
     } else if (comm_mode_str == "pgas-shm" || comm_mode_str == "pgas") {
         comm_mode = CommMode::PGAS_SHM;
+    } else if (comm_mode_str == "bulk-shm" || comm_mode_str == "bulk") {
+        comm_mode = CommMode::BULK_SHM;
     } else if (comm_mode_str == "distributed" || comm_mode_str == "dist") {
         comm_mode = CommMode::DISTRIBUTED;
     } else if (comm_mode_str != "tcp") {
-        SPDLOG_ERROR("Invalid communication mode: {}. Use 'tcp', 'shm', 'pgas-shm', or 'distributed'", comm_mode_str);
+        SPDLOG_ERROR("Invalid communication mode: {}. Use 'tcp', 'shm', 'pgas-shm', "
+                     "'bulk-shm', or 'distributed'",
+                     comm_mode_str);
+        return 1;
+    }
+
+    if (comm_mode == CommMode::BULK_SHM && backing_mode != SharedMemoryManager::BackingMode::SharedMemory) {
+        SPDLOG_ERROR("bulk-shm mode requires POSIX shared-memory backing");
         return 1;
     }
 
@@ -792,10 +836,15 @@ int main(int argc, char *argv[]) {
     const char *mode_str = (comm_mode == CommMode::TCP)        ? "TCP"
                            : (comm_mode == CommMode::SHM)      ? "Shared Memory (/dev/shm)"
                            : (comm_mode == CommMode::PGAS_SHM) ? "PGAS Shared Memory (cxl_backend.h)"
+                           : (comm_mode == CommMode::BULK_SHM) ? "Bulk Shared Memory"
                                                                : "Distributed Multi-Node";
     SPDLOG_INFO("  Communication Mode: {}", mode_str);
     if (comm_mode == CommMode::PGAS_SHM) {
         SPDLOG_INFO("  PGAS SHM Name: {}", pgas_shm_name);
+    }
+    if (comm_mode == CommMode::BULK_SHM) {
+        SPDLOG_INFO("  Bulk SHM Name: {}", bulk_shm_name);
+        SPDLOG_INFO("  Bulk Bandwidth: read={:.2f}GB/s write={:.2f}GB/s", bulk_read_bandwidth, bulk_write_bandwidth);
     }
     if (comm_mode == CommMode::DISTRIBUTED) {
         SPDLOG_INFO("  Node ID: {}", node_id);
@@ -974,7 +1023,8 @@ int main(int argc, char *argv[]) {
 
     try {
         ThreadPerConnectionServer server(port, controller, capacity, backing_file, comm_mode, pgas_shm_name,
-                                         backing_mode, ssd_config);
+                                         bulk_shm_name, bulk_read_bandwidth, bulk_write_bandwidth, default_latency,
+                                         default_latency + 50, backing_mode, ssd_config);
 
         if (!server.start()) {
             SPDLOG_ERROR("Failed to start server");
@@ -1003,6 +1053,8 @@ bool ThreadPerConnectionServer::start() {
     SPDLOG_INFO("Shared memory initialized:");
     SPDLOG_INFO("  Name: {}", shm_info.shm_name);
     SPDLOG_INFO("  Size: {} bytes", shm_info.size);
+    SPDLOG_INFO("  Data offset: {} bytes", shm_info.data_offset);
+    SPDLOG_INFO("  Data capacity: {} bytes", shm_info.data_size);
     SPDLOG_INFO("  Base address: 0x{:x}", shm_info.base_addr);
     SPDLOG_INFO("  Cachelines: {}", shm_info.num_cachelines);
 
@@ -1021,13 +1073,38 @@ bool ThreadPerConnectionServer::start() {
 
     case CommMode::PGAS_SHM:
         SPDLOG_INFO(">>> PGAS SHM mode: Skipping TCP socket initialization <<<");
-        pgas_memory_size_ = shm_info.size;
+        pgas_memory_size_ = shm_info.data_size;
         if (!init_pgas_shm(pgas_shm_name_, pgas_memory_size_)) {
             SPDLOG_ERROR("Failed to initialize PGAS shared memory");
             return false;
         }
         SPDLOG_INFO("Server using PGAS shared memory mode (cxl_backend.h protocol)");
         SPDLOG_INFO("No TCP port binding - communication via {} only", pgas_shm_name_);
+        return true;
+
+    case CommMode::BULK_SHM:
+        SPDLOG_INFO(">>> Bulk SHM mode: Skipping TCP socket initialization <<<");
+        if (!shm_info.direct_mappable) {
+            SPDLOG_ERROR("Bulk SHM mode requires directly mappable POSIX SHM data");
+            return false;
+        }
+        bulk_server_ = std::make_unique<CxlBulkShmServer>(CxlBulkShmServer::Config{
+            .control_name = bulk_shm_name_,
+            .data_name = shm_info.shm_name,
+            .data_mapped_size = shm_info.mapped_size,
+            .data_offset = shm_info.data_offset,
+            .data_size = shm_info.data_size,
+            .read_bandwidth_gbps = bulk_read_bandwidth_gbps_,
+            .write_bandwidth_gbps = bulk_write_bandwidth_gbps_,
+            .read_latency_ns = bulk_read_latency_ns_,
+            .write_latency_ns = bulk_write_latency_ns_,
+        });
+        if (!bulk_server_->initialize()) {
+            SPDLOG_ERROR("Failed to initialize bulk shared-memory transport");
+            bulk_server_.reset();
+            return false;
+        }
+        SPDLOG_INFO("Server using bulk shared-memory mode via {}", bulk_shm_name_);
         return true;
 
     case CommMode::TCP:
@@ -1083,6 +1160,11 @@ void ThreadPerConnectionServer::run() {
         run_pgas_shm_mode();
         return;
 
+    case CommMode::BULK_SHM:
+        SPDLOG_INFO("Running in bulk SHM mode (no TCP accept loop)");
+        run_bulk_shm_mode();
+        return;
+
     case CommMode::TCP:
         SPDLOG_INFO("Running in TCP mode");
         break;
@@ -1126,6 +1208,23 @@ void ThreadPerConnectionServer::run() {
     }
 }
 
+void ThreadPerConnectionServer::run_bulk_shm_mode() {
+    if (!bulk_server_) {
+        SPDLOG_ERROR("Bulk SHM server was not initialized");
+        return;
+    }
+    while (running && !shutdown_requested()) {
+        const int processed = bulk_server_->poll_once();
+        if (processed == 0) {
+            if (bulk_server_->has_pending()) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    }
+}
+
 void ThreadPerConnectionServer::stop() {
     bool was_running = running.exchange(false);
     if (!was_running) {
@@ -1138,6 +1237,14 @@ void ThreadPerConnectionServer::stop() {
             close(server_fd);
             server_fd = -1;
         }
+    }
+
+    CxlBulkServerStats bulk_stats{};
+    const bool has_bulk_stats = bulk_server_ != nullptr;
+    if (bulk_server_) {
+        bulk_stats = bulk_server_->stats();
+        bulk_server_->shutdown();
+        bulk_server_.reset();
     }
 
     std::vector<int> fds_to_close;
@@ -1171,6 +1278,15 @@ void ThreadPerConnectionServer::stop() {
     SPDLOG_INFO("  Coherency Invalidations: {}", coherency_invalidations.load());
     SPDLOG_INFO("  Coherency Downgrades: {}", coherency_downgrades.load());
     SPDLOG_INFO("  Back Invalidations: {}", back_invalidations.load());
+    if (has_bulk_stats) {
+        SPDLOG_INFO("  Bulk Requests: read={} write={}", bulk_stats.read_requests, bulk_stats.write_requests);
+        SPDLOG_INFO("  Bulk Bytes: read={} write={}", bulk_stats.read_bytes, bulk_stats.write_bytes);
+        SPDLOG_INFO("  Bulk Cachelines: read={} write={}", bulk_stats.read_cachelines, bulk_stats.write_cachelines);
+        SPDLOG_INFO("  Bulk Modeled Latency: {} ns", bulk_stats.total_model_latency_ns);
+        SPDLOG_INFO("  Bulk Failed Requests: {}", bulk_stats.failed_requests);
+        SPDLOG_INFO("  Bulk Abandoned Requests: {}", bulk_stats.abandoned_requests);
+        SPDLOG_INFO("  Bulk Orphaned Requests: {}", bulk_stats.orphaned_requests);
+    }
 
     // Print CXL controller topology statistics (switches/expanders/counters)
     if (controller) {

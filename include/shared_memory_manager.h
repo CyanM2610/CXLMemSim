@@ -121,7 +121,7 @@ private:
     std::vector<MemoryRegion> regions;
 
 public:
-    explicit SharedMemoryManager(size_t capacity_mb, const std::string &shm_name = "/cxlmemsim_pgas");
+    explicit SharedMemoryManager(size_t capacity_mb, const std::string &shm_name = "/cxlmemsim_shared");
     SharedMemoryManager(size_t capacity_mb, const std::string &shm_name, bool use_file, const std::string &file_path);
     SharedMemoryManager(size_t capacity_mb, const std::string &shm_name, const SsdStreamingConfig &ssd_config);
     ~SharedMemoryManager();
@@ -134,8 +134,12 @@ public:
     struct SharedMemoryInfo {
         std::string shm_name;
         size_t size;
+        size_t mapped_size;
+        size_t data_offset;
+        size_t data_size;
         uint64_t base_addr;
         size_t num_cachelines;
+        bool direct_mappable;
     };
     SharedMemoryInfo get_shm_info() const;
 

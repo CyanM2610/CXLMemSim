@@ -100,9 +100,50 @@ The server supports several communication modes:
 | `tcp`         | Socket-based QEMU/server communication.                                 |
 | `shm`         | Shared-memory ring-buffer communication through`/dev/shm`.            |
 | `pgas-shm`    | PGAS-style shared memory protocol used by`cxl_backend.h` clients.     |
+| `bulk-shm`    | Bulk host copies with cache-line CXL timing and accounting.           |
 | `distributed` | Multi-node memory server mode with SHM, TCP, RDMA, or hybrid transport. |
 
 The memory pool is managed by `SharedMemoryManager`. It can use POSIX shared memory or a regular file as a backing store. The shared-memory header records a magic value, format version, total size, data offset, base address, and cache-line count. The default cache-line data area is mapped with `mmap()` and is reused when the backing object already exists.
+
+### Bulk shared-memory clients
+
+`bulk-shm` is intended for large transfers such as KV-cache blocks. Start an
+externally managed server with a control object name shared by all clients:
+
+```bash
+./build/cxlmemsim_server \
+  --comm-mode=bulk-shm \
+  --bulk-shm-name=/cxlmemsim_bulk \
+  --capacity=4096 \
+  --default_latency=100 \
+  --bulk-read-bandwidth=25 \
+  --bulk-write-bandwidth=25
+```
+
+The installed `libcxlmemsim_client.so` exposes the C ABI in
+`include/cxl_bulk.h`. A client maps the server-published data region, performs
+one host `memcpy` per bulk request, and waits for the server's modeled CXL
+completion. The model expands every byte range into the cache lines it touches,
+applies direction-specific latency, and serializes reads and writes on
+independent bandwidth timelines. Thus the transport avoids one system-call or
+IPC round trip per 64-byte line without treating a multi-megabyte KV block as a
+single CXL transaction.
+
+The server owns and unlinks the control object. The data mapping remains under
+`SharedMemoryManager` lifecycle rules. Bulk mode accepts only POSIX shared
+memory backing; file and SSD-streaming backing fail before the protocol is
+published.
+
+The server holds an exclusive kernel lock on a stable `<control-name>.lock`
+object for its full lifetime. The small lock object persists across clean
+shutdowns; the versioned control ring itself is still unlinked. A duplicate
+server therefore fails instead of replacing a live ring, while a new server can
+safely replace a stale ring after an ungraceful exit. A generation published in
+both objects prevents clients from attaching to a ring from a prior server.
+Request slots also carry an atomic owner token encoding the client PID and Linux
+process-start identity, so the server can reclaim even reserved slots left by a
+crash without PID-reuse ambiguity; zombie clients count as dead. Callers of the
+C ABI must not close a client concurrently with an active transfer.
 
 When `include/ssd_streaming_backend.h` and `src/ssd_streaming_backend.cpp` are present, the server also builds an SSD streaming backing mode. This mode keeps the CXL address space persistent in a backing file or raw block device and routes cache-line reads and writes through `SsdStreamingBackend` instead of exposing a direct mmap pointer. The MVP backend uses 4KB page metadata by default, 64KB read-ahead (`16` pages at 4KB), a resident page cache sized by `--ssd-cache-mb`, CLOCK-like eviction in the backend, Linux `io_uring` with a registered fixed file/buffer when available, O_DIRECT-safe aligned page buffers, and placeholder hint plumbing for prefetch, pin/unpin, evict-after, and streaming ranges.
 
