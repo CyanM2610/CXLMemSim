@@ -11,10 +11,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdexcept>
-#include <type_traits>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <type_traits>
 #include <unistd.h>
 
 #ifdef CXLMEMSIM_HAS_SSD_STREAMING_BACKEND
@@ -23,6 +23,10 @@
 
 #define MAGIC_NUMBER 0x43584C4D454D5348ULL // "CXLMEMSH"
 #define FORMAT_VERSION 1
+
+namespace {
+constexpr size_t kSharedDataOffset = 4096;
+}
 
 #ifdef CXLMEMSIM_HAS_SSD_STREAMING_BACKEND
 namespace {
@@ -224,9 +228,9 @@ bool SharedMemoryManager::create_ssd_streaming_backend() {
 
         SPDLOG_INFO("SSD streaming backend initialized: path={} capacity={} page={} chunk={} cache_pages={} "
                     "read_ahead_pages={} io_uring={} odirect={}",
-                    ssd_config.backing_path, ssd_config.capacity_bytes, ssd_config.page_size,
-                    ssd_config.io_chunk_size, ssd_config.cache_pages, ssd_config.read_ahead_pages,
-                    ssd_config.use_io_uring, ssd_config.use_odirect);
+                    ssd_config.backing_path, ssd_config.capacity_bytes, ssd_config.page_size, ssd_config.io_chunk_size,
+                    ssd_config.cache_pages, ssd_config.read_ahead_pages, ssd_config.use_io_uring,
+                    ssd_config.use_odirect);
         return true;
     } catch (const std::exception &e) {
         SPDLOG_ERROR("Exception while initializing SSD streaming backend: {}", e.what());
@@ -244,9 +248,17 @@ bool SharedMemoryManager::map_shared_memory() {
         return false;
     }
 
-    // Set up pointers
+    // Set up pointers. Existing regions retain their advertised offset.
     header = reinterpret_cast<SharedMemoryHeader *>(shm_base);
-    data_area = reinterpret_cast<uint8_t *>(shm_base) + sizeof(SharedMemoryHeader);
+    size_t data_offset = kSharedDataOffset;
+    if (header->magic == MAGIC_NUMBER && header->version == FORMAT_VERSION) {
+        data_offset = header->data_offset;
+    }
+    if (data_offset < sizeof(SharedMemoryHeader) || data_offset > shm_size) {
+        SPDLOG_ERROR("Invalid shared-memory data offset: {}", data_offset);
+        return false;
+    }
+    data_area = reinterpret_cast<uint8_t *>(shm_base) + data_offset;
 
     SPDLOG_INFO("Mapped shared memory at address: 0x{:x}", reinterpret_cast<uintptr_t>(shm_base));
 
@@ -264,7 +276,7 @@ void SharedMemoryManager::initialize_header() {
     header->magic = MAGIC_NUMBER;
     header->version = FORMAT_VERSION;
     header->total_size = backing_mode == BackingMode::SsdStream ? ssd_config.capacity_bytes : shm_size;
-    header->data_offset = backing_mode == BackingMode::SsdStream ? 0 : sizeof(SharedMemoryHeader);
+    header->data_offset = backing_mode == BackingMode::SsdStream ? 0 : kSharedDataOffset;
     header->metadata_offset = 0; // Metadata is kept locally, not in shared memory
 
     // Support both low addresses (for testing) and high CXL addresses
@@ -336,10 +348,14 @@ size_t SharedMemoryManager::data_capacity_bytes() const {
     if (backing_mode == BackingMode::SsdStream) {
         return static_cast<size_t>(ssd_config.capacity_bytes);
     }
-    if (shm_size < sizeof(SharedMemoryHeader)) {
+    size_t data_offset = kSharedDataOffset;
+    if (header && header->magic == MAGIC_NUMBER && header->version == FORMAT_VERSION) {
+        data_offset = header->data_offset;
+    }
+    if (shm_size < data_offset) {
         return 0;
     }
-    return shm_size - sizeof(SharedMemoryHeader);
+    return shm_size - data_offset;
 }
 
 void SharedMemoryManager::set_base_addr(uint64_t addr) {
@@ -354,7 +370,7 @@ SharedMemoryManager::SharedMemoryInfo SharedMemoryManager::get_shm_info() const 
     info.shm_name = shm_name;
     info.size = backing_mode == BackingMode::SsdStream ? data_capacity_bytes() : shm_size;
     info.mapped_size = backing_mode == BackingMode::SsdStream ? 0 : shm_size;
-    info.data_offset = backing_mode == BackingMode::SsdStream ? 0 : sizeof(SharedMemoryHeader);
+    info.data_offset = backing_mode == BackingMode::SsdStream ? 0 : (header ? header->data_offset : kSharedDataOffset);
     info.data_size = data_capacity_bytes();
     info.base_addr = header ? header->base_addr : 0;
     info.num_cachelines = header ? header->num_cachelines : 0;
@@ -644,7 +660,7 @@ bool SharedMemoryManager::atomic_fetch_add_uint64(uint64_t addr, uint64_t value,
 }
 
 bool SharedMemoryManager::atomic_compare_exchange_uint64(uint64_t addr, uint64_t expected, uint64_t desired,
-                                                        uint64_t *old_value) {
+                                                         uint64_t *old_value) {
     if (!old_value) {
         return false;
     }

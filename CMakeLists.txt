@@ -115,7 +115,9 @@ set(SERVER_LIB_SOURCES
     src/tcp_communication.cpp
     src/rdma_communication.cpp
     src/cxl_bulk_server.cpp
-    src/cxl_bulk_model.cpp)
+    src/cxl_bulk_model.cpp
+    src/modeled_access_protocol.cpp
+    src/modeled_access_service.cpp)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/ssd_streaming_backend.h" AND
    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/ssd_streaming_backend.cpp")
     message(STATUS "SSD streaming backend enabled")
@@ -184,6 +186,10 @@ add_library(cxlmemsim_client SHARED src/cxl_bulk_client.c)
 target_include_directories(cxlmemsim_client PUBLIC include)
 target_link_libraries(cxlmemsim_client PRIVATE ${RT_LIB})
 
+add_library(cxlmemsim_modeled_client SHARED src/modeled_access_protocol.cpp)
+target_include_directories(cxlmemsim_modeled_client PUBLIC include)
+target_link_libraries(cxlmemsim_modeled_client PRIVATE ${RT_LIB} ${ATOMIC_LIB})
+
 add_executable(test_cxl_bulk_transport
     tests/test_cxl_bulk_transport.cpp
     src/cxl_bulk_server.cpp
@@ -192,6 +198,38 @@ target_include_directories(test_cxl_bulk_transport PRIVATE include)
 target_link_libraries(test_cxl_bulk_transport
     cxlmemsim_client ${RT_LIB} ${ATOMIC_LIB})
 add_test(NAME test_cxl_bulk_transport COMMAND test_cxl_bulk_transport)
+
+add_executable(test_modeled_access_protocol
+    tests/test_modeled_access_protocol.cpp
+    src/modeled_access_protocol.cpp)
+target_include_directories(test_modeled_access_protocol PRIVATE include)
+target_link_libraries(test_modeled_access_protocol PRIVATE ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_modeled_access_protocol COMMAND test_modeled_access_protocol)
+
+add_executable(test_modeled_access_service
+    tests/test_modeled_access_service.cpp
+    src/modeled_access_service.cpp
+    src/cxl_bulk_model.cpp)
+target_include_directories(test_modeled_access_service PRIVATE include)
+target_link_libraries(test_modeled_access_service PRIVATE ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_modeled_access_service COMMAND test_modeled_access_service)
+
+add_executable(test_modeled_access_no_copy
+    tests/test_modeled_access_no_copy.cpp
+    src/modeled_access_service.cpp
+    src/cxl_bulk_model.cpp)
+target_include_directories(test_modeled_access_no_copy PRIVATE include)
+target_link_libraries(test_modeled_access_no_copy PRIVATE ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_modeled_access_no_copy COMMAND test_modeled_access_no_copy)
+
+add_executable(test_modeled_access_transport
+    tests/test_modeled_access_transport.cpp
+    src/modeled_access_service.cpp
+    src/cxl_bulk_model.cpp)
+target_include_directories(test_modeled_access_transport PRIVATE include)
+target_link_libraries(test_modeled_access_transport
+    cxlmemsim_modeled_client ${RT_LIB} ${ATOMIC_LIB})
+add_test(NAME test_modeled_access_transport COMMAND test_modeled_access_transport)
 
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
@@ -210,7 +248,11 @@ install(TARGETS cxlmemsim_client
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
+install(TARGETS cxlmemsim_modeled_client
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
 
 install(FILES include/tcp_communication.h include/rdma_communication.h
-        include/dcd_gfam.h include/cxl_bulk.h
+        include/dcd_gfam.h include/cxl_bulk.h include/modeled_access_protocol.h
         DESTINATION include/cxlmemsim)

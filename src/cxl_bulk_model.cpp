@@ -44,34 +44,46 @@ CxlBulkTransferModel::CxlBulkTransferModel(double read_gbps, double write_gbps, 
 
 CxlBulkTiming CxlBulkTransferModel::schedule(CxlBulkDirection direction, uint64_t bytes, uint64_t submitted_ns,
                                              uint64_t byte_offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool is_read = direction == CxlBulkDirection::Read;
+    uint64_t &next_free = is_read ? next_read_free_ns_ : next_write_free_ns_;
+    const auto value = estimate(direction, bytes, byte_offset);
+    const uint64_t service_start = std::max(submitted_ns, next_free);
+
+    const uint64_t max_timestamp = std::numeric_limits<uint64_t>::max();
+    if (value.service_ns > max_timestamp - service_start) {
+        throw std::overflow_error("bulk completion timestamp overflow");
+    }
+
+    next_free = service_start + value.serialization_ns;
+    const uint64_t completion = service_start + value.service_ns;
+    return {
+        .service_start_ns = service_start,
+        .completion_ns = completion,
+        .model_latency_ns = completion - submitted_ns,
+        .serialization_ns = value.serialization_ns,
+        .cacheline_count = value.cacheline_count,
+    };
+}
+
+CxlBulkEstimate CxlBulkTransferModel::estimate(CxlBulkDirection direction, uint64_t bytes, uint64_t byte_offset) const {
     if (bytes == 0) {
         throw std::invalid_argument("bulk transfer size must be positive");
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
     const bool is_read = direction == CxlBulkDirection::Read;
     const double bandwidth = is_read ? read_gbps_ : write_gbps_;
     const uint64_t latency = is_read ? read_latency_ns_ : write_latency_ns_;
-    uint64_t &next_free = is_read ? next_read_free_ns_ : next_write_free_ns_;
     const uint64_t logical_cachelines = cacheline_count(bytes, byte_offset);
     if (logical_cachelines > std::numeric_limits<uint64_t>::max() / kCachelineBytes) {
         throw std::overflow_error("bulk cache-line footprint overflow");
     }
     const uint64_t wire_bytes = logical_cachelines * kCachelineBytes;
     const uint64_t serialization = serialization_time_ns(wire_bytes, bandwidth);
-    const uint64_t service_start = std::max(submitted_ns, next_free);
-
-    const uint64_t max_timestamp = std::numeric_limits<uint64_t>::max();
-    if (serialization > max_timestamp - service_start || latency > max_timestamp - service_start - serialization) {
-        throw std::overflow_error("bulk completion timestamp overflow");
+    if (latency > std::numeric_limits<uint64_t>::max() - serialization) {
+        throw std::overflow_error("bulk service duration overflow");
     }
-
-    next_free = service_start + serialization;
-    const uint64_t completion = next_free + latency;
     return {
-        .service_start_ns = service_start,
-        .completion_ns = completion,
-        .model_latency_ns = completion - submitted_ns,
+        .service_ns = serialization + latency,
         .serialization_ns = serialization,
         .cacheline_count = logical_cachelines,
     };

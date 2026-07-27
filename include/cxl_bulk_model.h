@@ -16,10 +16,17 @@ struct CxlBulkTiming {
     uint64_t cacheline_count;
 };
 
+struct CxlBulkEstimate {
+    uint64_t service_ns;
+    uint64_t serialization_ns;
+    uint64_t cacheline_count;
+};
+
 class CxlBulkTransferModel {
 public:
     CxlBulkTransferModel(double read_gbps, double write_gbps, uint64_t read_latency_ns, uint64_t write_latency_ns);
 
+    CxlBulkEstimate estimate(CxlBulkDirection direction, uint64_t bytes, uint64_t byte_offset = 0) const;
     CxlBulkTiming schedule(CxlBulkDirection direction, uint64_t bytes, uint64_t submitted_ns, uint64_t byte_offset = 0);
 
 private:

@@ -145,6 +145,33 @@ process-start identity, so the server can reclaim even reserved slots left by a
 crash without PID-reuse ambiguity; zombie clients count as dead. Callers of the
 C ABI must not close a client concurrently with an active transfer.
 
+### GPU-direct modeled access
+
+`bulk-shm` can additionally publish the metadata-only
+`gpu_direct_modeled_access_v1` capability:
+
+```bash
+./build/cxlmemsim_server \
+  --comm-mode=bulk-shm \
+  --bulk-shm-name=/cxlmemsim_bulk \
+  --enable-gpu-direct-modeled-access=true \
+  --modeled-access-shm-name=/cxlmemsim_modeled \
+  --capacity=4096
+```
+
+The installed `libcxlmemsim_modeled_client.so` exposes the C ABI in
+`include/modeled_access_protocol.h`. Requests carry only operation identity,
+direction, region token, offset, length, and timestamps. The modeled-access
+handler never reads or writes the payload. A caller starts the model before
+launching its CUDA copy, reports the CUDA terminal state, and treats the later
+of CUDA completion and modeled completion as the logical completion. The two
+durations are concurrent branches and must not be added.
+
+Modeled access is disabled unless explicitly requested. Clients fail closed
+when the capability, protocol version, provider, capacity, or alignment does
+not match. The POSIX data area begins at a page-aligned offset advertised in
+the shared-memory header so it can be registered independently with CUDA.
+
 When `include/ssd_streaming_backend.h` and `src/ssd_streaming_backend.cpp` are present, the server also builds an SSD streaming backing mode. This mode keeps the CXL address space persistent in a backing file or raw block device and routes cache-line reads and writes through `SsdStreamingBackend` instead of exposing a direct mmap pointer. The MVP backend uses 4KB page metadata by default, 64KB read-ahead (`16` pages at 4KB), a resident page cache sized by `--ssd-cache-mb`, CLOCK-like eviction in the backend, Linux `io_uring` with a registered fixed file/buffer when available, O_DIRECT-safe aligned page buffers, and placeholder hint plumbing for prefetch, pin/unpin, evict-after, and streaming ranges.
 
 The server CLI uses local parse-result structs in `src/main_server.cc`, `src/main.cc`, and `src/rob.cc`, so command-line parsing is handled in-tree.

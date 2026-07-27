@@ -14,6 +14,7 @@
 #include "cxlcontroller.h"
 #include "cxlendpoint.h"
 #include "distributed_server.h"
+#include "modeled_access_service.h"
 #include "policy.h"
 #include "shm_communication.h"
 #include <algorithm>
@@ -156,6 +157,9 @@ private:
     uint64_t bulk_read_latency_ns_;
     uint64_t bulk_write_latency_ns_;
     std::unique_ptr<CxlBulkShmServer> bulk_server_;
+    bool enable_modeled_access_;
+    std::string modeled_access_shm_name_;
+    std::unique_ptr<cxlmemsim::ModeledAccessShmServer> modeled_access_server_;
 
     // Shared memory manager for real memory allocation
     std::unique_ptr<SharedMemoryManager> shm_manager;
@@ -235,14 +239,16 @@ public:
         CommMode mode = CommMode::TCP, const std::string &pgas_shm_name = "/cxlmemsim_pgas",
         const std::string &bulk_shm_name = "/cxlmemsim_bulk", double bulk_read_bandwidth_gbps = 25.0,
         double bulk_write_bandwidth_gbps = 25.0, uint64_t bulk_read_latency_ns = 100,
-        uint64_t bulk_write_latency_ns = 150,
+        uint64_t bulk_write_latency_ns = 150, bool enable_modeled_access = false,
+        const std::string &modeled_access_shm_name = "/cxlmemsim_modeled",
         SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory,
         const SharedMemoryManager::SsdStreamingConfig &ssd_config = {})
         : server_fd(-1), port(port), controller(ctrl), running(true), next_thread_id(0), comm_mode(mode),
           pgas_shm_name_(pgas_shm_name), pgas_shm_fd_(-1), pgas_shm_header_(nullptr), pgas_memory_(nullptr),
           pgas_memory_size_(0), bulk_shm_name_(bulk_shm_name), bulk_read_bandwidth_gbps_(bulk_read_bandwidth_gbps),
           bulk_write_bandwidth_gbps_(bulk_write_bandwidth_gbps), bulk_read_latency_ns_(bulk_read_latency_ns),
-          bulk_write_latency_ns_(bulk_write_latency_ns), backing_file_(backing_file), backing_mode_(backing_mode),
+          bulk_write_latency_ns_(bulk_write_latency_ns), enable_modeled_access_(enable_modeled_access),
+          modeled_access_shm_name_(modeled_access_shm_name), backing_file_(backing_file), backing_mode_(backing_mode),
           ssd_config_(ssd_config) {
         congestion_info.active_requests = 0;
         congestion_info.total_bandwidth_used = 0;
@@ -359,6 +365,8 @@ struct ServerOptions {
     std::string bulk_shm_name = "/cxlmemsim_bulk";
     double bulk_read_bandwidth = 25.0;
     double bulk_write_bandwidth = 25.0;
+    bool enable_modeled_access = false;
+    std::string modeled_access_shm_name = "/cxlmemsim_modeled";
     uint32_t node_id = 0;
     std::string dist_shm_name = "/cxlmemsim_dist";
     std::string coordinator_shm;
@@ -401,6 +409,9 @@ static void print_server_help(const char *program) {
               << "      --bulk-shm-name <name>         Bulk control shared memory name\n"
               << "      --bulk-read-bandwidth <GB/s>   Bulk read bandwidth (default: 25)\n"
               << "      --bulk-write-bandwidth <GB/s>  Bulk write bandwidth (default: 25)\n"
+              << "      --enable-gpu-direct-modeled-access[=true|false]\n"
+              << "                                      Advertise metadata-only modeled access (default: false)\n"
+              << "      --modeled-access-shm-name <name> Modeled-access control SHM name\n"
               << "      --node-id <id>                 Distributed node ID\n"
               << "      --dist-shm-name <name>         Distributed shared memory name\n"
               << "      --coordinator-shm <name>       Coordinator shared memory to join\n"
@@ -583,6 +594,10 @@ static bool parse_server_options(int argc, char *argv[], ServerOptions &opts, st
                 opts.bulk_read_bandwidth = std::stod(get_value(key));
             } else if (key == "bulk-write-bandwidth") {
                 opts.bulk_write_bandwidth = std::stod(get_value(key));
+            } else if (key == "enable-gpu-direct-modeled-access") {
+                opts.enable_modeled_access = parse_optional_bool_option(argc, argv, i, value, has_inline_value);
+            } else if (key == "modeled-access-shm-name") {
+                opts.modeled_access_shm_name = get_value(key);
             } else if (key == "node-id") {
                 opts.node_id = static_cast<uint32_t>(std::stoul(get_value(key)));
             } else if (key == "dist-shm-name") {
@@ -654,6 +669,8 @@ int main(int argc, char *argv[]) {
     const auto &bulk_shm_name = opts.bulk_shm_name;
     double bulk_read_bandwidth = opts.bulk_read_bandwidth;
     double bulk_write_bandwidth = opts.bulk_write_bandwidth;
+    bool enable_modeled_access = opts.enable_modeled_access;
+    const auto &modeled_access_shm_name = opts.modeled_access_shm_name;
     uint32_t node_id = opts.node_id;
     const auto &dist_shm_name = opts.dist_shm_name;
     const auto &coordinator_shm = opts.coordinator_shm;
@@ -672,11 +689,9 @@ int main(int argc, char *argv[]) {
 
     SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory;
     if (!backing_mode_str.empty()) {
-        if (backing_mode_str == "shm" || backing_mode_str == "shared-memory" ||
-            backing_mode_str == "shared_memory") {
+        if (backing_mode_str == "shm" || backing_mode_str == "shared-memory" || backing_mode_str == "shared_memory") {
             backing_mode = SharedMemoryManager::BackingMode::SharedMemory;
-        } else if (backing_mode_str == "file" || backing_mode_str == "mmap-file" ||
-                   backing_mode_str == "mmap_file") {
+        } else if (backing_mode_str == "file" || backing_mode_str == "mmap-file" || backing_mode_str == "mmap_file") {
             backing_mode = SharedMemoryManager::BackingMode::FileMmap;
         } else if (backing_mode_str == "ssd-stream" || backing_mode_str == "ssd_stream") {
             backing_mode = SharedMemoryManager::BackingMode::SsdStream;
@@ -726,8 +741,7 @@ int main(int argc, char *argv[]) {
     ssd_config.page_size = opts.ssd_page_size;
     ssd_config.io_chunk_size = opts.ssd_io_chunk_size;
     ssd_config.cache_pages = static_cast<size_t>(
-        (static_cast<uint64_t>(opts.ssd_cache_mb) * 1024ULL * 1024ULL + opts.ssd_page_size - 1) /
-        opts.ssd_page_size);
+        (static_cast<uint64_t>(opts.ssd_cache_mb) * 1024ULL * 1024ULL + opts.ssd_page_size - 1) / opts.ssd_page_size);
     ssd_config.read_ahead_pages = opts.ssd_read_ahead_pages;
     ssd_config.use_io_uring = opts.ssd_io_uring;
     ssd_config.use_odirect = opts.ssd_odirect;
@@ -764,6 +778,14 @@ int main(int argc, char *argv[]) {
 
     if (comm_mode == CommMode::BULK_SHM && backing_mode != SharedMemoryManager::BackingMode::SharedMemory) {
         SPDLOG_ERROR("bulk-shm mode requires POSIX shared-memory backing");
+        return 1;
+    }
+    if (enable_modeled_access && comm_mode != CommMode::BULK_SHM) {
+        SPDLOG_ERROR("--enable-gpu-direct-modeled-access requires --comm-mode=bulk-shm");
+        return 1;
+    }
+    if (enable_modeled_access && (modeled_access_shm_name.empty() || modeled_access_shm_name[0] != '/')) {
+        SPDLOG_ERROR("--modeled-access-shm-name must be an absolute POSIX SHM name");
         return 1;
     }
 
@@ -845,6 +867,11 @@ int main(int argc, char *argv[]) {
     if (comm_mode == CommMode::BULK_SHM) {
         SPDLOG_INFO("  Bulk SHM Name: {}", bulk_shm_name);
         SPDLOG_INFO("  Bulk Bandwidth: read={:.2f}GB/s write={:.2f}GB/s", bulk_read_bandwidth, bulk_write_bandwidth);
+        SPDLOG_INFO("  GPU Direct Modeled Access: {}",
+                    enable_modeled_access ? "gpu_direct_modeled_access_v1" : "disabled");
+        if (enable_modeled_access) {
+            SPDLOG_INFO("  Modeled Access SHM Name: {}", modeled_access_shm_name);
+        }
     }
     if (comm_mode == CommMode::DISTRIBUTED) {
         SPDLOG_INFO("  Node ID: {}", node_id);
@@ -875,10 +902,10 @@ int main(int argc, char *argv[]) {
     SPDLOG_INFO("  Port: {}", port);
     SPDLOG_INFO("  Topology: {}", topology);
     SPDLOG_INFO("  Capacity: {} MB", capacity);
-    const char *backing_mode_label = backing_mode == SharedMemoryManager::BackingMode::SsdStream
-                                         ? "SSD streaming"
-                                     : backing_mode == SharedMemoryManager::BackingMode::FileMmap ? "mmap file"
-                                                                                                   : "POSIX shared memory";
+    const char *backing_mode_label = backing_mode == SharedMemoryManager::BackingMode::SsdStream ? "SSD streaming"
+                                     : backing_mode == SharedMemoryManager::BackingMode::FileMmap
+                                         ? "mmap file"
+                                         : "POSIX shared memory";
     SPDLOG_INFO("  Backing Mode: {}", backing_mode_label);
     if (backing_mode == SharedMemoryManager::BackingMode::FileMmap) {
         SPDLOG_INFO("  Backing File: {}", backing_file);
@@ -1024,7 +1051,8 @@ int main(int argc, char *argv[]) {
     try {
         ThreadPerConnectionServer server(port, controller, capacity, backing_file, comm_mode, pgas_shm_name,
                                          bulk_shm_name, bulk_read_bandwidth, bulk_write_bandwidth, default_latency,
-                                         default_latency + 50, backing_mode, ssd_config);
+                                         default_latency + 50, enable_modeled_access, modeled_access_shm_name,
+                                         backing_mode, ssd_config);
 
         if (!server.start()) {
             SPDLOG_ERROR("Failed to start server");
@@ -1103,6 +1131,30 @@ bool ThreadPerConnectionServer::start() {
             SPDLOG_ERROR("Failed to initialize bulk shared-memory transport");
             bulk_server_.reset();
             return false;
+        }
+        if (enable_modeled_access_) {
+            modeled_access_server_ =
+                std::make_unique<cxlmemsim::ModeledAccessShmServer>(cxlmemsim::ModeledAccessShmServer::Config{
+                    .control_name = modeled_access_shm_name_,
+                    .service =
+                        {
+                            .provider_capacity = shm_info.data_size,
+                            .provider_alignment = 4096,
+                            .provider = cxlmemsim::ModeledAccessProvider::PosixShm,
+                            .read_bandwidth_gbps = bulk_read_bandwidth_gbps_,
+                            .write_bandwidth_gbps = bulk_write_bandwidth_gbps_,
+                            .read_latency_ns = bulk_read_latency_ns_,
+                            .write_latency_ns = bulk_write_latency_ns_,
+                        },
+                });
+            if (!modeled_access_server_->initialize()) {
+                SPDLOG_ERROR("Failed to initialize gpu_direct_modeled_access_v1 service");
+                modeled_access_server_.reset();
+                bulk_server_->shutdown();
+                bulk_server_.reset();
+                return false;
+            }
+            SPDLOG_INFO("Advertised capability gpu_direct_modeled_access_v1 via {}", modeled_access_shm_name_);
         }
         SPDLOG_INFO("Server using bulk shared-memory mode via {}", bulk_shm_name_);
         return true;
@@ -1214,9 +1266,12 @@ void ThreadPerConnectionServer::run_bulk_shm_mode() {
         return;
     }
     while (running && !shutdown_requested()) {
-        const int processed = bulk_server_->poll_once();
+        int processed = bulk_server_->poll_once();
+        if (modeled_access_server_) {
+            processed += modeled_access_server_->pollOnce();
+        }
         if (processed == 0) {
-            if (bulk_server_->has_pending()) {
+            if (bulk_server_->has_pending() || (modeled_access_server_ && modeled_access_server_->hasPending())) {
                 std::this_thread::yield();
             } else {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -1245,6 +1300,13 @@ void ThreadPerConnectionServer::stop() {
         bulk_stats = bulk_server_->stats();
         bulk_server_->shutdown();
         bulk_server_.reset();
+    }
+    cxlmemsim::ModeledAccessStats modeled_stats{};
+    const bool has_modeled_stats = modeled_access_server_ != nullptr;
+    if (modeled_access_server_) {
+        modeled_stats = modeled_access_server_->stats();
+        modeled_access_server_->shutdown();
+        modeled_access_server_.reset();
     }
 
     std::vector<int> fds_to_close;
@@ -1286,6 +1348,15 @@ void ThreadPerConnectionServer::stop() {
         SPDLOG_INFO("  Bulk Failed Requests: {}", bulk_stats.failed_requests);
         SPDLOG_INFO("  Bulk Abandoned Requests: {}", bulk_stats.abandoned_requests);
         SPDLOG_INFO("  Bulk Orphaned Requests: {}", bulk_stats.orphaned_requests);
+    }
+    if (has_modeled_stats) {
+        SPDLOG_INFO("  Modeled Access Ops: read={} write={}", modeled_stats.read_operations,
+                    modeled_stats.write_operations);
+        SPDLOG_INFO("  Modeled Access Bytes: read={} write={}", modeled_stats.read_bytes, modeled_stats.write_bytes);
+        SPDLOG_INFO("  Modeled Access Queue: depth={} high_watermark={}", modeled_stats.queue_depth,
+                    modeled_stats.queue_high_watermark);
+        SPDLOG_INFO("  Modeled Access Errors: {} cancels={}", modeled_stats.errors, modeled_stats.cancels);
+        SPDLOG_INFO("  Modeled Access Payload Copy Bytes: {}", modeled_stats.payload_copy_bytes);
     }
 
     // Print CXL controller topology statistics (switches/expanders/counters)
@@ -1860,8 +1931,8 @@ void ThreadPerConnectionServer::handle_bi_request(int thread_id, const ServerReq
         uint64_t cacheline_addr = req.addr & SHM_CACHELINE_MASK;
         std::vector<uint8_t> dirty_data(req.data, req.data + size);
 
-        if (req.addr > std::numeric_limits<uint64_t>::max() - (size - 1) ||
-            !shm_manager->is_valid_address(req.addr) || !shm_manager->is_valid_address(req.addr + size - 1)) {
+        if (req.addr > std::numeric_limits<uint64_t>::max() - (size - 1) || !shm_manager->is_valid_address(req.addr) ||
+            !shm_manager->is_valid_address(req.addr + size - 1)) {
             SPDLOG_ERROR("Thread {}: Invalid BI writeback address 0x{:x}", thread_id, req.addr);
             resp.status = 1;
             break;
@@ -2163,7 +2234,8 @@ void ThreadPerConnectionServer::handle_client(int client_fd, int thread_id) {
 
         // Clamp size to data buffer limit to prevent out-of-bounds reads
         if ((req.op_type == OP_READ || req.op_type == OP_WRITE || req.op_type == OP_LSA_READ ||
-             req.op_type == OP_LSA_WRITE) && req.size > sizeof(req.data)) {
+             req.op_type == OP_LSA_WRITE) &&
+            req.size > sizeof(req.data)) {
             SPDLOG_WARN("Thread {}: Clamping request size from {} to {} (data buffer limit)", thread_id,
                         (uint64_t)req.size, sizeof(req.data));
             req.size = sizeof(req.data);
