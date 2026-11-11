@@ -316,6 +316,58 @@ int cxl_modeled_poll_access(cxl_modeled_client_t *client, uint64_t access_token,
         });
 }
 
+int cxl_modeled_begin_access_batch(cxl_modeled_client_t *client, uint64_t client_id, uint32_t direction,
+                                   uint64_t region, const cxl_modeled_range_t *ranges, uint32_t count,
+                                   cxl_modeled_timed_begin_t *results, uint32_t *completed) {
+    if (completed == nullptr) {
+        return CXL_MODELED_ERROR_INVALID_ARGUMENT;
+    }
+    *completed = 0;
+    if (client == nullptr || ranges == nullptr || results == nullptr || count == 0) {
+        return CXL_MODELED_ERROR_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        auto &out = results[i];
+        out.started_ns = monotonicTimeNs();
+        const int status = cxl_modeled_begin_access(client, ranges[i].op_id, client_id, direction, region,
+                                                    ranges[i].offset, ranges[i].bytes, out.started_ns, &out.result);
+        out.observed_ns = monotonicTimeNs();
+        if (status != CXL_MODELED_SUCCESS) {
+            return status;
+        }
+        ++*completed;
+    }
+    return CXL_MODELED_SUCCESS;
+}
+
+int cxl_modeled_completion_batch(cxl_modeled_client_t *client, const uint64_t *tokens, uint32_t count,
+                                 uint32_t cuda_status, uint64_t data_complete_ns,
+                                 cxl_modeled_batch_poll_result_t *results) {
+    if (!clientAlive(client) || tokens == nullptr || results == nullptr || count == 0) {
+        return CXL_MODELED_ERROR_INVALID_ARGUMENT;
+    }
+    const bool combined = (client->header->capability_bits & cxlmemsim::kModeledCompleteAndPoll) != 0;
+    int status = CXL_MODELED_SUCCESS;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto &out = results[i];
+        out = {};
+        if (status == CXL_MODELED_SUCCESS) {
+            if (cuda_status == static_cast<uint32_t>(cxlmemsim::ModeledAccessCudaStatus::Pending)) {
+                status = cxl_modeled_poll_access(client, tokens[i], &out.result);
+            } else if (combined) {
+                status = cxl_modeled_complete_and_poll(client, tokens[i], cuda_status, data_complete_ns, &out.result);
+            } else {
+                status = cxl_modeled_data_complete(client, tokens[i], cuda_status, data_complete_ns);
+                if (status == CXL_MODELED_SUCCESS) {
+                    status = cxl_modeled_poll_access(client, tokens[i], &out.result);
+                }
+            }
+        }
+        out.call_status = status;
+    }
+    return CXL_MODELED_SUCCESS;
+}
+
 int cxl_modeled_cancel_access(cxl_modeled_client_t *client, uint64_t access_token, const char *reason) {
     if (client == nullptr || access_token == 0 || reason == nullptr ||
         std::strlen(reason) >= cxlmemsim::kModeledAccessReasonBytes) {

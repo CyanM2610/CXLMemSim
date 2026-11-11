@@ -196,6 +196,49 @@ int main() {
                                          &gated_poll) == CXL_MODELED_SUCCESS);
     assert(gated_poll.state == static_cast<uint32_t>(ModeledAccessState::Complete));
 
+    const cxl_modeled_range_t ranges[] = {{100, 0, 64}, {101, 4090, 64}, {102, 0, 64}};
+    cxl_modeled_timed_begin_t began[3]{};
+    uint32_t completed = 99;
+    assert(cxl_modeled_begin_access_batch(first_client, 11, static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl),
+                                          region, ranges, 3, began, &completed) == CXL_MODELED_ERROR_RANGE);
+    assert(completed == 1 && began[0].result.access_token != 0);
+    assert(began[0].observed_ns >= began[0].started_ns);
+    const uint64_t batch_tokens[] = {began[0].result.access_token, UINT64_MAX};
+    cxl_modeled_batch_poll_result_t batch_results[2]{};
+    assert(cxl_modeled_completion_batch(first_client, batch_tokens, 2,
+                                        static_cast<uint32_t>(ModeledAccessCudaStatus::Pending), 0,
+                                        batch_results) == CXL_MODELED_SUCCESS);
+    assert(batch_results[0].call_status == CXL_MODELED_SUCCESS);
+    assert(batch_results[0].result.state != static_cast<uint32_t>(ModeledAccessState::Complete));
+    assert(batch_results[1].call_status == CXL_MODELED_ERROR_SERVER);
+    assert(cxl_modeled_completion_batch(first_client, batch_tokens, 2,
+                                        static_cast<uint32_t>(ModeledAccessCudaStatus::Error), nowNs(),
+                                        batch_results) == CXL_MODELED_SUCCESS);
+    assert(batch_results[0].result.state == static_cast<uint32_t>(ModeledAccessState::Error));
+    assert(batch_results[1].call_status == CXL_MODELED_ERROR_SERVER);
+
+    cxl_modeled_begin_result_t pending[2]{};
+    const uint64_t pending_start = nowNs() + 10'000'000'000ULL;
+    for (uint64_t i = 0; i < 2; ++i) {
+        assert(cxl_modeled_begin_access(first_client, 120 + i, 11,
+                                        static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl), region, i * 64, 64,
+                                        pending_start, &pending[i]) == CXL_MODELED_SUCCESS);
+    }
+    const uint64_t pending_tokens[] = {pending[0].access_token, pending[1].access_token};
+    assert(cxl_modeled_completion_batch(first_client, pending_tokens, 2,
+                                        static_cast<uint32_t>(ModeledAccessCudaStatus::Success), pending_start,
+                                        batch_results) == CXL_MODELED_SUCCESS);
+    for (uint32_t i = 0; i < 2; ++i) {
+        assert(batch_results[i].call_status == CXL_MODELED_SUCCESS);
+        assert(batch_results[i].result.state == static_cast<uint32_t>(ModeledAccessState::DataComplete));
+        assert(cxl_modeled_cancel_access(first_client, pending_tokens[i], "batch test") == CXL_MODELED_SUCCESS);
+    }
+    assert(cxl_modeled_completion_batch(first_client, pending_tokens, 2,
+                                        static_cast<uint32_t>(ModeledAccessCudaStatus::Pending), 0,
+                                        batch_results) == CXL_MODELED_SUCCESS);
+    assert(batch_results[0].result.state == static_cast<uint32_t>(ModeledAccessState::Cancelled));
+    assert(batch_results[1].result.state == static_cast<uint32_t>(ModeledAccessState::Cancelled));
+
     cxl_modeled_client_close(first_client);
     cxl_modeled_client_close(second_client);
     running.store(false, std::memory_order_relaxed);

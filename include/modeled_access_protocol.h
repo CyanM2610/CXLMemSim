@@ -167,6 +167,24 @@ typedef struct cxl_modeled_poll_result {
     uint64_t modeled_complete_ns;
 } cxl_modeled_poll_result_t;
 
+typedef struct cxl_modeled_range {
+    uint64_t op_id;
+    uint64_t offset;
+    uint64_t bytes;
+} cxl_modeled_range_t;
+
+typedef struct cxl_modeled_timed_begin {
+    cxl_modeled_begin_result_t result;
+    uint64_t started_ns;
+    uint64_t observed_ns;
+} cxl_modeled_timed_begin_t;
+
+typedef struct cxl_modeled_batch_poll_result {
+    int32_t call_status;
+    uint32_t reserved;
+    cxl_modeled_poll_result_t result;
+} cxl_modeled_batch_poll_result_t;
+
 int cxl_modeled_client_open(const char *control_name, uint32_t timeout_ms, cxl_modeled_client_t **out_client);
 void cxl_modeled_client_close(cxl_modeled_client_t *client);
 int cxl_modeled_get_capabilities(const cxl_modeled_client_t *client, cxl_modeled_capabilities_t *result);
@@ -183,6 +201,18 @@ int cxl_modeled_poll_access(cxl_modeled_client_t *client, uint64_t access_token,
 // must be polled later. Requires kModeledCompleteAndPoll, keeps the v1 SHM layout.
 int cxl_modeled_complete_and_poll(cxl_modeled_client_t *client, uint64_t access_token, uint32_t cuda_status,
                                   uint64_t data_complete_ns, cxl_modeled_poll_result_t *result);
+// Perform the same ordered v1 exchanges inside one FFI call. On begin failure,
+// completed identifies the successful prefix whose tokens the caller must drain.
+// CUDA ownership and the server's per-access model states remain independent.
+int cxl_modeled_begin_access_batch(cxl_modeled_client_t *client, uint64_t client_id, uint32_t direction,
+                                   uint64_t region, const cxl_modeled_range_t *ranges, uint32_t count,
+                                   cxl_modeled_timed_begin_t *results, uint32_t *completed);
+// cuda_status==Pending polls only. Otherwise report the observed CUDA state and
+// poll each token. A transport error stops exchanges and marks the suffix failed;
+// no successful prefix or per-access pending state is discarded.
+int cxl_modeled_completion_batch(cxl_modeled_client_t *client, const uint64_t *tokens, uint32_t count,
+                                 uint32_t cuda_status, uint64_t data_complete_ns,
+                                 cxl_modeled_batch_poll_result_t *results);
 int cxl_modeled_cancel_access(cxl_modeled_client_t *client, uint64_t access_token, const char *reason);
 const char *cxl_modeled_error_string(int error_code);
 
