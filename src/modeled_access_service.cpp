@@ -91,6 +91,19 @@ ModeledAccessBeginResult ModeledAccessService::beginAccess(const ModeledAccessRe
     if (estimate.service_ns > std::numeric_limits<uint64_t>::max() - request.start_ns) {
         return {ModeledAccessStatus::OutOfRange, 0, 0};
     }
+    auto &queue = request.direction == ModeledAccessDirection::ReadFromCxl ? read_queue_ : write_queue_;
+    uint64_t next_free_ns = 0;
+    if (!queue.empty()) {
+        const auto &previous = accesses_.at(queue.back());
+        const auto previous_estimate =
+            timing_model_.estimate(bulkDirection(request.direction), previous.bytes, previous.offset);
+        next_free_ns = previous.service_start_ns + previous_estimate.serialization_ns;
+    }
+    const uint64_t service_start_ns = std::max(request.start_ns, next_free_ns);
+    if (estimate.service_ns > std::numeric_limits<uint64_t>::max() - service_start_ns ||
+        estimate.serialization_ns > std::numeric_limits<uint64_t>::max() - service_start_ns) {
+        return {ModeledAccessStatus::OutOfRange, 0, 0};
+    }
     const uint64_t token = next_access_token_++;
     ModeledAccessRecord record{
         .op_id = request.op_id,
@@ -101,10 +114,10 @@ ModeledAccessBeginResult ModeledAccessService::beginAccess(const ModeledAccessRe
         .offset = request.offset,
         .bytes = request.bytes,
         .start_ns = request.start_ns,
-        .service_start_ns = request.start_ns,
-        .queue_ns = 0,
+        .service_start_ns = service_start_ns,
+        .queue_ns = service_start_ns - request.start_ns,
         .service_ns = estimate.service_ns,
-        .modeled_complete_ns = request.start_ns + estimate.service_ns,
+        .modeled_complete_ns = service_start_ns + estimate.service_ns,
         .data_complete_ns = 0,
         .cuda_status = ModeledAccessCudaStatus::Pending,
         .state = ModeledAccessState::Pending,
@@ -112,9 +125,9 @@ ModeledAccessBeginResult ModeledAccessService::beginAccess(const ModeledAccessRe
     };
     accesses_.emplace(token, record);
     op_tokens_.emplace(request.op_id, token);
-    auto &queue = request.direction == ModeledAccessDirection::ReadFromCxl ? read_queue_ : write_queue_;
     queue.push_back(token);
-    recomputeQueue(request.direction);
+    // Appending cannot change earlier reservations. Only cancellation needs
+    // to recompute existing entries; do not rescan the entire access history.
     stats_.queue_high_watermark = std::max<uint64_t>(stats_.queue_high_watermark, queue.size());
     if (request.direction == ModeledAccessDirection::ReadFromCxl) {
         ++stats_.read_operations;
@@ -280,7 +293,7 @@ bool ModeledAccessShmServer::initialize() {
     header_->header_size = sizeof(*header_);
     header_->endian_marker = kModeledAccessEndianMarker;
     header_->slot_count = kModeledAccessMaxSlots;
-    header_->capability_bits = kGpuDirectModeledAccessV1;
+    header_->capability_bits = kGpuDirectModeledAccessV1 | kModeledCompleteAndPoll;
     header_->server_generation = monotonicTimeNs() ^ (static_cast<uint64_t>(getpid()) << 32);
     if (header_->server_generation == 0) {
         header_->server_generation = 1;
@@ -363,6 +376,15 @@ void ModeledAccessShmServer::handle(ModeledAccessSlot &slot) {
             slot.status = static_cast<uint32_t>(service_.dataComplete(
                 slot.access_token, static_cast<ModeledAccessCudaStatus>(slot.cuda_status), slot.data_complete_ns));
             break;
+        case ModeledAccessOperation::CompleteAndPoll: {
+            const auto status = service_.dataComplete(
+                slot.access_token, static_cast<ModeledAccessCudaStatus>(slot.cuda_status), slot.data_complete_ns);
+            if (status != ModeledAccessStatus::Ok) {
+                slot.status = static_cast<uint32_t>(status);
+                break;
+            }
+            [[fallthrough]];
+        }
         case ModeledAccessOperation::PollAccess: {
             const auto result = service_.pollAccess(slot.access_token, monotonicTimeNs());
             slot.status = static_cast<uint32_t>(result.status);

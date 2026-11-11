@@ -121,7 +121,7 @@ int main() {
     cxl_modeled_capabilities_t capabilities{};
     assert(cxl_modeled_get_capabilities(first_client, &capabilities) == CXL_MODELED_SUCCESS);
     assert(capabilities.protocol_version == kModeledAccessVersion);
-    assert(capabilities.capability_bits == kGpuDirectModeledAccessV1);
+    assert(capabilities.capability_bits == (kGpuDirectModeledAccessV1 | kModeledCompleteAndPoll));
     assert(capabilities.data_capacity == 4096);
 
     uint64_t region = 0;
@@ -162,6 +162,39 @@ int main() {
     cxl_modeled_begin_result_t invalid{};
     assert(cxl_modeled_begin_access(first_client, 3, 11, static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl),
                                     region, 4090, 64, start, &invalid) == CXL_MODELED_ERROR_RANGE);
+
+    // A combined report must still wait for a future model deadline. Using a
+    // future start makes the assertion independent of host scheduling delays.
+    const uint64_t future_start = nowNs() + 10'000'000'000ULL;
+    cxl_modeled_begin_result_t gated{};
+    assert(cxl_modeled_begin_access(first_client, 4, 11, static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl),
+                                    region, 0, 1024, future_start, &gated) == CXL_MODELED_SUCCESS);
+    cxl_modeled_poll_result_t gated_poll{};
+    assert(cxl_modeled_complete_and_poll(first_client, gated.access_token,
+                                         static_cast<uint32_t>(ModeledAccessCudaStatus::Success), future_start,
+                                         &gated_poll) == CXL_MODELED_SUCCESS);
+    assert(gated_poll.state == static_cast<uint32_t>(ModeledAccessState::DataComplete));
+    assert(gated_poll.modeled_complete_ns == gated.estimated_complete_ns);
+    assert(gated_poll.service_ns == 102'500);
+    assert(cxl_modeled_cancel_access(first_client, gated.access_token, "pending test") == CXL_MODELED_SUCCESS);
+
+    cxl_modeled_begin_result_t failure{};
+    assert(cxl_modeled_begin_access(first_client, 5, 11, static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl),
+                                    region, 0, 64, nowNs(), &failure) == CXL_MODELED_SUCCESS);
+    assert(cxl_modeled_complete_and_poll(first_client, failure.access_token,
+                                         static_cast<uint32_t>(ModeledAccessCudaStatus::Error), nowNs(),
+                                         &gated_poll) == CXL_MODELED_SUCCESS);
+    assert(gated_poll.state == static_cast<uint32_t>(ModeledAccessState::Error));
+    cxl_modeled_begin_result_t success{};
+    assert(cxl_modeled_begin_access(first_client, 6, 11, static_cast<uint32_t>(ModeledAccessDirection::ReadFromCxl),
+                                    region, 0, 64, nowNs(), &success) == CXL_MODELED_SUCCESS);
+    while (nowNs() < success.estimated_complete_ns) {
+        std::this_thread::yield();
+    }
+    assert(cxl_modeled_complete_and_poll(first_client, success.access_token,
+                                         static_cast<uint32_t>(ModeledAccessCudaStatus::Success), nowNs(),
+                                         &gated_poll) == CXL_MODELED_SUCCESS);
+    assert(gated_poll.state == static_cast<uint32_t>(ModeledAccessState::Complete));
 
     cxl_modeled_client_close(first_client);
     cxl_modeled_client_close(second_client);

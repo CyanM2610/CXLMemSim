@@ -3,6 +3,7 @@
 #include "modeled_access_service.h"
 
 #include <cassert>
+#include <vector>
 
 using namespace cxlmemsim;
 
@@ -29,6 +30,27 @@ uint64_t registerRegion(ModeledAccessService &service) {
 } // namespace
 
 int main() {
+    // A long same-time burst queues by serialization time, not service latency.
+    // Cancelling its head shifts every successor, including a later append.
+    auto burst = makeService();
+    const auto burst_region = registerRegion(burst);
+    std::vector<uint64_t> tokens;
+    for (uint64_t i = 0; i < 1024; ++i) {
+        const auto entry =
+            burst.beginAccess({i + 1, 1, ModeledAccessDirection::ReadFromCxl, burst_region, 0, 64, 1'000});
+        assert(entry.status == ModeledAccessStatus::Ok);
+        assert(entry.estimated_complete_ns == 1'000 + (i + 1) * 64 + 100);
+        tokens.push_back(entry.access_token);
+    }
+    assert(burst.cancelAccess(tokens.front(), "head removed", 1'001).state == ModeledAccessState::Cancelled);
+    for (size_t i = 1; i < tokens.size(); ++i) {
+        const auto polled = burst.pollAccess(tokens[i], 1'001);
+        assert(polled.queue_ns == (i - 1) * 64);
+        assert(polled.modeled_complete_ns == 1'000 + i * 64 + 100);
+    }
+    const auto appended = burst.beginAccess({1025, 1, ModeledAccessDirection::ReadFromCxl, burst_region, 0, 64, 1'000});
+    assert(appended.estimated_complete_ns == 1'000 + 1024 * 64 + 100);
+
     auto service = makeService();
     const uint64_t region = registerRegion(service);
 

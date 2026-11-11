@@ -14,6 +14,7 @@ inline constexpr uint32_t kModeledAccessVersion = 1;
 inline constexpr uint32_t kModeledAccessEndianMarker = UINT32_C(0x01020304);
 inline constexpr uint32_t kModeledAccessMaxSlots = 64;
 inline constexpr uint64_t kGpuDirectModeledAccessV1 = UINT64_C(1) << 0;
+inline constexpr uint64_t kModeledCompleteAndPoll = UINT64_C(1) << 1;
 inline constexpr std::size_t kModeledAccessReasonBytes = 64;
 
 enum class ModeledAccessOperation : uint32_t {
@@ -22,6 +23,7 @@ enum class ModeledAccessOperation : uint32_t {
     DataComplete = 3,
     PollAccess = 4,
     CancelAccess = 5,
+    CompleteAndPoll = 6,
 };
 
 enum class ModeledAccessDirection : uint32_t {
@@ -176,6 +178,11 @@ int cxl_modeled_begin_access(cxl_modeled_client_t *client, uint64_t op_id, uint6
 int cxl_modeled_data_complete(cxl_modeled_client_t *client, uint64_t access_token, uint32_t cuda_status,
                               uint64_t data_complete_ns);
 int cxl_modeled_poll_access(cxl_modeled_client_t *client, uint64_t access_token, cxl_modeled_poll_result_t *result);
+// Report a real terminal CUDA observation and return the current model state in
+// one exchange. COMPLETE still requires the modeled deadline; a pending result
+// must be polled later. Requires kModeledCompleteAndPoll, keeps the v1 SHM layout.
+int cxl_modeled_complete_and_poll(cxl_modeled_client_t *client, uint64_t access_token, uint32_t cuda_status,
+                                  uint64_t data_complete_ns, cxl_modeled_poll_result_t *result);
 int cxl_modeled_cancel_access(cxl_modeled_client_t *client, uint64_t access_token, const char *reason);
 const char *cxl_modeled_error_string(int error_code);
 

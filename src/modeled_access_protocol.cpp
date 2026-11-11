@@ -277,6 +277,30 @@ int cxl_modeled_data_complete(cxl_modeled_client_t *client, uint64_t access_toke
         [](const auto &) {});
 }
 
+int cxl_modeled_complete_and_poll(cxl_modeled_client_t *client, uint64_t access_token, uint32_t cuda_status,
+                                  uint64_t data_complete_ns, cxl_modeled_poll_result_t *result) {
+    if (!clientAlive(client) || access_token == 0 || data_complete_ns == 0 || result == nullptr) {
+        return CXL_MODELED_ERROR_INVALID_ARGUMENT;
+    }
+    if ((client->header->capability_bits & cxlmemsim::kModeledCompleteAndPoll) == 0) {
+        return CXL_MODELED_ERROR_UNSUPPORTED;
+    }
+    return submit(
+        client, cxlmemsim::ModeledAccessOperation::CompleteAndPoll,
+        [&](auto &slot) {
+            slot.access_token = access_token;
+            slot.cuda_status = cuda_status;
+            slot.data_complete_ns = data_complete_ns;
+        },
+        [&](const auto &slot) {
+            result->state = slot.terminal_state;
+            result->error_code = slot.error_code;
+            result->queue_ns = slot.queue_ns;
+            result->service_ns = slot.service_ns;
+            result->modeled_complete_ns = slot.modeled_complete_ns;
+        });
+}
+
 int cxl_modeled_poll_access(cxl_modeled_client_t *client, uint64_t access_token, cxl_modeled_poll_result_t *result) {
     if (client == nullptr || access_token == 0 || result == nullptr) {
         return CXL_MODELED_ERROR_INVALID_ARGUMENT;
