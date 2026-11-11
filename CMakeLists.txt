@@ -231,6 +231,15 @@ target_link_libraries(test_modeled_access_transport
     cxlmemsim_modeled_client ${RT_LIB} ${ATOMIC_LIB})
 add_test(NAME test_modeled_access_transport COMMAND test_modeled_access_transport)
 
+# These contract tests use assert for checks and setup calls (e.g. ftruncate).
+# Keep them active in Release too; otherwise the SHM tests map zero-length
+# files and SIGBUS, while the pure model tests can pass without checking data.
+foreach(contract_test IN ITEMS test_cxl_bulk_model test_cxl_bulk_transport
+        test_modeled_access_protocol test_modeled_access_service
+        test_modeled_access_no_copy test_modeled_access_transport)
+    target_compile_options(${contract_test} PRIVATE -UNDEBUG)
+endforeach()
+
 # Integration-style test clients. They require an external server/DAX setup, so
 # CMake builds them but does not register them as always-on CTest tests.
 add_executable(test_back_invalidation tests/test_back_invalidation.cpp)

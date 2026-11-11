@@ -242,7 +242,8 @@ public:
         uint64_t bulk_write_latency_ns = 150, bool enable_modeled_access = false,
         const std::string &modeled_access_shm_name = "/cxlmemsim_modeled",
         SharedMemoryManager::BackingMode backing_mode = SharedMemoryManager::BackingMode::SharedMemory,
-        const SharedMemoryManager::SsdStreamingConfig &ssd_config = {})
+        const SharedMemoryManager::SsdStreamingConfig &ssd_config = {},
+        const std::string &data_shm_name = "/cxlmemsim_shared")
         : server_fd(-1), port(port), controller(ctrl), running(true), next_thread_id(0), comm_mode(mode),
           pgas_shm_name_(pgas_shm_name), pgas_shm_fd_(-1), pgas_shm_header_(nullptr), pgas_memory_(nullptr),
           pgas_memory_size_(0), bulk_shm_name_(bulk_shm_name), bulk_read_bandwidth_gbps_(bulk_read_bandwidth_gbps),
@@ -257,12 +258,12 @@ public:
         // Initialize shared memory manager
         if (backing_mode_ == SharedMemoryManager::BackingMode::SsdStream) {
             SPDLOG_INFO("Using SSD streaming backing for memory: {}", ssd_config_.backing_path);
-            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, "/cxlmemsim_shared", ssd_config_);
+            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, data_shm_name, ssd_config_);
         } else if (!backing_file_.empty()) {
             SPDLOG_INFO("Using backing file for memory: {}", backing_file_);
-            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, "/cxlmemsim_shared", true, backing_file_);
+            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, data_shm_name, true, backing_file_);
         } else {
-            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb);
+            shm_manager = std::make_unique<SharedMemoryManager>(capacity_mb, data_shm_name);
         }
 
         // Initialize LSA storage (256KB default per CXL spec)
@@ -363,6 +364,7 @@ struct ServerOptions {
     std::string comm_mode_str = "tcp";
     std::string pgas_shm_name = "/cxlmemsim_pgas";
     std::string bulk_shm_name = "/cxlmemsim_bulk";
+    std::string data_shm_name = "/cxlmemsim_shared";
     double bulk_read_bandwidth = 25.0;
     double bulk_write_bandwidth = 25.0;
     bool enable_modeled_access = false;
@@ -407,6 +409,7 @@ static void print_server_help(const char *program) {
               << "      --comm-mode <mode>             tcp, shm, pgas-shm, bulk-shm, or distributed\n"
               << "      --pgas-shm-name <name>         PGAS shared memory name\n"
               << "      --bulk-shm-name <name>         Bulk control shared memory name\n"
+              << "      --data-shm-name <name>         Payload shared memory name\n"
               << "      --bulk-read-bandwidth <GB/s>   Bulk read bandwidth (default: 25)\n"
               << "      --bulk-write-bandwidth <GB/s>  Bulk write bandwidth (default: 25)\n"
               << "      --enable-gpu-direct-modeled-access[=true|false]\n"
@@ -590,6 +593,12 @@ static bool parse_server_options(int argc, char *argv[], ServerOptions &opts, st
                 opts.pgas_shm_name = get_value(key);
             } else if (key == "bulk-shm-name") {
                 opts.bulk_shm_name = get_value(key);
+            } else if (key == "data-shm-name") {
+                opts.data_shm_name = get_value(key);
+                if (opts.data_shm_name.size() < 2 || opts.data_shm_name[0] != '/' ||
+                    opts.data_shm_name.find('/', 1) != std::string::npos) {
+                    throw std::invalid_argument("data-shm-name must be / followed by a single non-empty name");
+                }
             } else if (key == "bulk-read-bandwidth") {
                 opts.bulk_read_bandwidth = std::stod(get_value(key));
             } else if (key == "bulk-write-bandwidth") {
@@ -1052,7 +1061,7 @@ int main(int argc, char *argv[]) {
         ThreadPerConnectionServer server(port, controller, capacity, backing_file, comm_mode, pgas_shm_name,
                                          bulk_shm_name, bulk_read_bandwidth, bulk_write_bandwidth, default_latency,
                                          default_latency + 50, enable_modeled_access, modeled_access_shm_name,
-                                         backing_mode, ssd_config);
+                                         backing_mode, ssd_config, opts.data_shm_name);
 
         if (!server.start()) {
             SPDLOG_ERROR("Failed to start server");
